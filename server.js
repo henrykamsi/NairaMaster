@@ -382,3 +382,26 @@ app.listen(PORT, () => {
   console.log(` Webhook URL: /api/webhooks/squad`);
   console.log(`====================================================`);
 });
+
+// Secure Addition: Bank Account Lookup Route
+app.post('/api/payout/account-lookup', async (req, res) => {
+  try {
+    const { bank_code, account_number } = req.body;
+    if (!bank_code || !account_number) {
+      return res.status(400).json({ error: 'bank_code and account_number are required.' });
+    }
+    const response = await axios.get('https://sandbox-api.squadco.com/payout/account/lookup', {
+      params: { bank_code, account_number },
+      headers: {
+        'Authorization': `Bearer ${process.env.SQUAD_SECRET_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(error.response?.status || 500).json({
+      error: 'Failed to lookup account.',
+      details: error.response?.data || error.message
+    });
+  }
+});
