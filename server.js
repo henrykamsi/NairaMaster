@@ -390,7 +390,7 @@ app.post('/api/payout/account-lookup', async (req, res) => {
     if (!bank_code || !account_number) {
       return res.status(400).json({ error: 'bank_code and account_number are required.' });
     }
-    const response = await axios.get('https://sandbox-api.squadco.com/payout/account/lookup', {
+    const response = await axios.get('https://api.squadco.com/payout/account/lookup', {
       params: { bank_code, account_number },
       headers: {
         'Authorization': `Bearer ${process.env.SQUAD_SECRET_KEY}`,
