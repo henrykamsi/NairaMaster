@@ -122,8 +122,8 @@ app.post('/api/payment/initialize', async (req, res) => {
         });
       }
     } else {
-      if (!amount || Number(amount) < 500) {
-        return res.status(400).json({ error: "Minimum top-up amount is ₦500." });
+      if (!amount || Number(amount) < 100) {
+        return res.status(400).json({ error: "Minimum top-up amount is ₦100." });
       }
       finalAmount = Number(amount);
     }
