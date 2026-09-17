@@ -1,407 +1,3047 @@
-const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
-const axios = require('axios');
-const admin = require('firebase-admin');
-require('dotenv').config();
+/**
+ * ============================================================
+ * NAIRA MASTER — HGT SQUAD PAYMENT BACKEND
+ * ============================================================
+ *
+ * SINGLE-FILE SERVER
+ *
+ * Stack:
+ *   Node.js
+ *   Express
+ *   Firebase Admin
+ *   Squad API
+ *
+ * Designed for:
+ *   Naira Master PWA
+ *   Henry Global Tech
+ *   Render
+ *
+ * IMPORTANT:
+ *   NEVER put SQUAD_SECRET_KEY or FIREBASE_PRIVATE_KEY
+ *   in frontend code.
+ *
+ *   Put all secrets in Render Environment Variables.
+ *
+ * ============================================================
+ */
+
+import "dotenv/config";
+
+import express from "express";
+import cors from "cors";
+import crypto from "crypto";
+import admin from "firebase-admin";
+
+
+/* ============================================================
+   BASIC CONFIGURATION
+   ============================================================ */
 
 const app = express();
 
-app.use(cors({ origin: true }));
-app.use(express.json());
+const PORT = Number(process.env.PORT || 10000);
 
-// -----------------------------------------------------------------------------
-// 1. FIREBASE ADMIN SDK INITIALIZATION
-// -----------------------------------------------------------------------------
-if (!process.env.FIREBASE_PROJECT_ID || !process.env.FIREBASE_PRIVATE_KEY) {
-  console.error("CRITICAL ERROR: Firebase Admin environment variables missing!");
-  process.exit(1);
+const NODE_ENV =
+  process.env.NODE_ENV || "development";
+
+const SQUAD_ENV =
+  String(process.env.SQUAD_ENV || "sandbox").toLowerCase();
+
+const FRONTEND_URL =
+  process.env.FRONTEND_URL || "*";
+
+const WEBHOOK_VERSION =
+  String(process.env.SQUAD_WEBHOOK_VERSION || "auto").toLowerCase();
+
+
+/* ============================================================
+   SQUAD BASE URL
+   ============================================================ */
+
+const SQUAD_BASE_URL =
+  SQUAD_ENV === "production"
+    ? "https://api-d.squadco.com"
+    : "https://sandbox-api-d.squadco.com";
+
+
+/* ============================================================
+   REQUIRED ENVIRONMENT VARIABLES
+   ============================================================ */
+
+if (!process.env.SQUAD_SECRET_KEY) {
+  throw new Error(
+    "Missing SQUAD_SECRET_KEY environment variable."
+  );
 }
 
-const formattedPrivateKey = process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n');
+if (!process.env.FIREBASE_PROJECT_ID) {
+  throw new Error(
+    "Missing FIREBASE_PROJECT_ID environment variable."
+  );
+}
+
+if (!process.env.FIREBASE_CLIENT_EMAIL) {
+  throw new Error(
+    "Missing FIREBASE_CLIENT_EMAIL environment variable."
+  );
+}
+
+if (!process.env.FIREBASE_PRIVATE_KEY) {
+  throw new Error(
+    "Missing FIREBASE_PRIVATE_KEY environment variable."
+  );
+}
+
+
+/* ============================================================
+   FIREBASE ADMIN
+   ============================================================ */
 
 admin.initializeApp({
   credential: admin.credential.cert({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: formattedPrivateKey,
-  }),
+    projectId:
+      process.env.FIREBASE_PROJECT_ID,
+
+    clientEmail:
+      process.env.FIREBASE_CLIENT_EMAIL,
+
+    privateKey:
+      process.env.FIREBASE_PRIVATE_KEY
+        .replace(/\\n/g, "\n")
+  })
 });
 
 const db = admin.firestore();
 
-// -----------------------------------------------------------------------------
-// 2. FIXED TIER PRICING CONFIGURATION (Matches Screenshot UI)
-// -----------------------------------------------------------------------------
-const LOCKED_TIER_PRICES = {
-  cobra: 0,         // Free Plan
-  lieutenant: 3500, // ₦3,500
-  commander: 4500,  // ₦4,500
-  general: 6000,    // ₦6,000
-};
+const FieldValue =
+  admin.firestore.FieldValue;
 
-// -----------------------------------------------------------------------------
-// 3. SECURITY & UTILITIES
-// -----------------------------------------------------------------------------
-function verifySquadSignature(req) {
-  const squadSignature = req.headers['x-squad-encrypted-body'] || req.headers['x-squad-signature'];
-  if (!squadSignature || !process.env.SQUAD_WEBHOOK_SECRET) return false;
 
-  const hash = crypto
-    .createHmac('sha512', process.env.SQUAD_WEBHOOK_SECRET)
-    .update(JSON.stringify(req.body))
-    .digest('hex')
-    .toUpperCase();
+/* ============================================================
+   EXPRESS SECURITY
+   ============================================================ */
 
-  return hash === squadSignature.toUpperCase();
-}
+app.disable("x-powered-by");
 
-function calculateWithdrawalFee(amount) {
-  if (amount >= 1000 && amount <= 10000) return 300;
-  if (amount > 10000) return 500;
-  throw new Error("Invalid withdrawal amount. Minimum is ₦1,000.");
-}
 
-// -----------------------------------------------------------------------------
-// 4. API ENDPOINTS
-// -----------------------------------------------------------------------------
+/* ============================================================
+   CORS
+   ============================================================ */
 
-/**
- * HEALTH CHECK: Verify server is alive and talking to DB
+app.use(
+  cors({
+    origin:
+      FRONTEND_URL === "*"
+        ? true
+        : FRONTEND_URL,
+
+    methods: [
+      "GET",
+      "POST",
+      "PATCH",
+      "DELETE",
+      "OPTIONS"
+    ],
+
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization"
+    ]
+  })
+);
+
+
+/* ============================================================
+   IMPORTANT WEBHOOK RAW-BODY HANDLING
+   ============================================================ */
+
+/*
+ * Squad webhook signatures are generated from webhook data.
+ *
+ * Therefore the webhook route MUST receive the raw body
+ * before express.json() modifies it.
  */
-app.get('/api/health', async (req, res) => {
-  try {
-    await db.collection('apps').limit(1).get();
-    return res.status(200).json({
-      status: "online",
-      message: "Server is live and connected to Firestore.",
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    return res.status(500).json({
-      status: "degraded",
-      error: "Server running, but Firestore failed.",
-      details: error.message
-    });
-  }
-});
 
-/**
- * PAYMENT INITIALIZATION: Generate Checkout URL or Assign Free Tier
- */
-app.post('/api/payment/initialize', async (req, res) => {
-  try {
-    const { email, amount, payment_type, tier_id, app_id, user_id } = req.body;
+app.post(
+  "/api/squad/webhook",
+  express.raw({
+    type: "application/json",
+    limit: "2mb"
+  }),
+  squadWebhook
+);
 
-    if (!app_id || !user_id || !email) {
-      return res.status(400).json({ error: "Missing required parameters (app_id, user_id, email)." });
-    }
 
-    let finalAmount = 0;
+/* ============================================================
+   NORMAL JSON BODY
+   ============================================================ */
 
-    if (payment_type === 'tier') {
-      const normalizedTier = (tier_id || '').toLowerCase();
-      if (LOCKED_TIER_PRICES[normalizedTier] === undefined) {
-        return res.status(400).json({ error: "Invalid tier upgrade selected." });
-      }
+app.use(
+  express.json({
+    limit: "200kb"
+  })
+);
 
-      finalAmount = LOCKED_TIER_PRICES[normalizedTier];
 
-      // Handle Free Tier (Cobra) Instantly without Squad
-      if (finalAmount === 0) {
-        const userRef = db.collection('apps').doc(app_id).collection('users').doc(user_id);
-        await userRef.set({
-          tier: normalizedTier,
-          tierUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
+/* ============================================================
+   HEALTH CHECK
+   ============================================================ */
 
-        return res.status(200).json({
-          success: true,
-          message: `Successfully assigned ${normalizedTier} (Free Plan).`,
-          free_tier: true
-        });
-      }
-    } else {
-      if (!amount || Number(amount) < 100) {
-        return res.status(400).json({ error: "Minimum top-up amount is ₦100." });
-      }
-      finalAmount = Number(amount);
-    }
+app.get(
+  "/health",
+  (_req, res) => {
 
-    const transactionRef = `${app_id}_${payment_type}_${user_id}_${Date.now()}`;
-    const payload = {
-      email,
-      amount: finalAmount * 100, // Squad uses Kobo
-      currency: "NGN",
-      initiate_type: "inline",
-      transaction_ref: transactionRef,
-      metadata: { app_id, user_id, payment_type, tier_id: tier_id || null },
-    };
-
-    const response = await axios.post(
-      `${process.env.SQUAD_BASE_URL}/transaction/initiate`,
-      payload,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.SQUAD_SECRET_KEY}`,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-
-    return res.status(200).json({
+    res.json({
       success: true,
-      transaction_ref: transactionRef,
-      amount: finalAmount,
-      checkout_url: response.data.data.checkout_url, // Explicit Checkout URL
-      squad_data: response.data.data,
-    });
-  } catch (error) {
-    return res.status(500).json({ error: "Failed to initialize payment gateway.", details: error.message });
-  }
-});
 
-/**
- * PAYMENT VERIFICATION: Manual check
- */
-app.post('/api/payment/verify', async (req, res) => {
-  try {
-    const { transaction_ref } = req.body;
-    if (!transaction_ref) return res.status(400).json({ error: "Transaction reference required." });
+      service:
+        "Naira Master HGT Squad Backend",
 
-    const response = await axios.get(
-      `${process.env.SQUAD_BASE_URL}/transaction/verify/${transaction_ref}`,
-      { headers: { Authorization: `Bearer ${process.env.SQUAD_SECRET_KEY}` } }
-    );
+      environment:
+        SQUAD_ENV,
 
-    const squadData = response.data.data;
-    if (response.data.status === 200 && squadData.transaction_status === 'success') {
-      const processed = await processSuccessfulPayment(squadData);
-      return res.status(200).json({ success: true, status: 'success', data: processed });
-    } else {
-      return res.status(400).json({ success: false, status: squadData.transaction_status });
-    }
-  } catch (error) {
-    return res.status(500).json({ error: "Error verifying transaction." });
-  }
-});
+      status:
+        "online",
 
-/**
- * WEBHOOK ROUTER: Process auto-callbacks
- */
-app.post('/api/webhooks/squad', async (req, res) => {
-  if (!verifySquadSignature(req)) {
-    return res.status(400).send("Invalid signature header.");
-  }
-
-  const { event, data } = req.body;
-  try {
-    if (event === 'charge.success' || event === 'virtual_account.credited') {
-      await processSuccessfulPayment(data);
-    }
-    return res.status(200).json({ status: "success", message: "Webhook processed." });
-  } catch (err) {
-    return res.status(500).send("Webhook internal server error.");
-  }
-});
-
-/**
- * CORE PAYMENT PROCESSOR
- */
-async function processSuccessfulPayment(data) {
-  const transactionRef = data.transaction_ref || data.transaction_reference;
-  const metadata = data.metadata || {};
-  const appId = metadata.app_id || transactionRef.split('_')[0];
-  const userId = metadata.user_id || transactionRef.split('_')[2];
-  const paymentType = metadata.payment_type || transactionRef.split('_')[1];
-
-  if (!appId || !userId) throw new Error("Missing context metadata.");
-
-  const amountPaidInNaira = Number(data.amount || data.transaction_amount) / 100;
-  const txRefDoc = db.collection('apps').doc(appId).collection('transactions').doc(transactionRef);
-
-  return await db.runTransaction(async (transaction) => {
-    const docSnapshot = await transaction.get(txRefDoc);
-    if (docSnapshot.exists && docSnapshot.data().status === 'success') {
-      return { already_processed: true };
-    }
-
-    const userRef = db.collection('apps').doc(appId).collection('users').doc(userId);
-
-    if (paymentType === 'tier') {
-      const tierId = metadata.tier_id || 'upgraded';
-      transaction.set(userRef, { tier: tierId, tierUpdatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    } else {
-      transaction.set(userRef, {
-        walletBalance: admin.firestore.FieldValue.increment(amountPaidInNaira),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-    }
-
-    transaction.set(txRefDoc, {
-      transactionRef, userId, appId, amount: amountPaidInNaira, type: paymentType || 'topup',
-      status: 'success', channel: data.payment_method || 'squad', processedAt: admin.firestore.FieldValue.serverTimestamp(),
+      timestamp:
+        new Date().toISOString()
     });
 
-    return { success: true, creditedAmount: amountPaidInNaira };
-  });
+  }
+);
+
+
+/* ============================================================
+   UTILITY FUNCTIONS
+   ============================================================ */
+
+
+/**
+ * Generate unique merchant reference.
+ */
+function generateReference(prefix) {
+
+  return (
+    prefix +
+    "_" +
+    Date.now() +
+    "_" +
+    crypto
+      .randomBytes(6)
+      .toString("hex")
+      .toUpperCase()
+  );
+
 }
 
+
 /**
- * CREATE VIRTUAL ACCOUNT
+ * Convert Naira to kobo.
+ *
+ * ₦100 = 10000 kobo
  */
-app.post('/api/virtual-account/create', async (req, res) => {
-  try {
-    const { first_name, last_name, mobile_num, email, bvn, dob, gender, address, customer_identifier } = req.body;
-    
-    if (!first_name || !last_name || !mobile_num || !email) {
-      return res.status(400).json({ error: "Missing basic required fields." });
-    }
+function nairaToKobo(amount) {
 
-    const payload = {
-      first_name, last_name, mobile_num, email, bvn, dob, gender, address, customer_identifier
-    };
+  const value =
+    Number(amount);
 
-    const response = await axios.post(
-      `${process.env.SQUAD_BASE_URL}/virtual-account`,
-      payload,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.SQUAD_SECRET_KEY}`,
-          'Content-Type': 'application/json',
-        },
-      }
+  if (
+    !Number.isFinite(value)
+  ) {
+    throw new Error(
+      "Invalid amount."
     );
-
-    return res.status(200).json({ success: true, virtual_account_data: response.data.data });
-  } catch (error) {
-    return res.status(500).json({ error: "Failed to create virtual account.", details: error.response?.data || error.message });
   }
-});
 
-/**
- * ACCOUNT LOOKUP API
- */
-app.post('/api/withdraw/account-lookup', async (req, res) => {
-  try {
-    const { bank_code, account_number } = req.body;
-    if (!bank_code || !account_number) return res.status(400).json({ error: "Bank code and account number required." });
-
-    const response = await axios.post(
-      `${process.env.SQUAD_BASE_URL}/payout/account/lookup`,
-      { bank_code, account_number },
-      { headers: { Authorization: `Bearer ${process.env.SQUAD_SECRET_KEY}`, 'Content-Type': 'application/json' } }
+  if (
+    value < 100
+  ) {
+    throw new Error(
+      "Minimum payment amount is ₦100."
     );
-
-    return res.status(200).json({ success: true, data: response.data.data });
-  } catch (error) {
-    return res.status(500).json({ error: "Could not resolve bank account details." });
   }
-});
+
+  if (
+    Math.round(value * 100) !==
+    value * 100
+  ) {
+    throw new Error(
+      "Amount can contain a maximum of two decimal places."
+    );
+  }
+
+  return Math.round(
+    value * 100
+  );
+
+}
+
 
 /**
- * WITHDRAWAL REQUEST API
+ * Compare strings safely.
  */
-app.post('/api/withdraw/request', async (req, res) => {
+function safeEqual(a, b) {
+
   try {
-    const { app_id, user_id, amount, bank_code, account_number, account_name } = req.body;
-    const requestedAmount = Number(amount);
 
-    if (!app_id || !user_id || !requestedAmount || requestedAmount < 1000) {
-      return res.status(400).json({ error: "Minimum withdrawal amount is ₦1,000." });
-    }
-
-    const fee = calculateWithdrawalFee(requestedAmount);
-    const totalDeduction = requestedAmount + fee;
-    const userRef = db.collection('apps').doc(app_id).collection('users').doc(user_id);
-
-    await db.runTransaction(async (transaction) => {
-      const userDoc = await transaction.get(userRef);
-      if (!userDoc.exists) throw new Error("User record not found.");
-      
-      const currentBalance = userDoc.data().walletBalance || 0;
-      if (currentBalance < totalDeduction) {
-        throw new Error(`Insufficient funds. Need ₦${totalDeduction}, balance is ₦${currentBalance}.`);
-      }
-      transaction.update(userRef, { walletBalance: admin.firestore.FieldValue.increment(-totalDeduction) });
-    });
-
-    const transferRef = `WDR_${app_id}_${user_id}_${Date.now()}`;
-    try {
-      await axios.post(
-        `${process.env.SQUAD_BASE_URL}/payout/transfer`,
-        { remark: "Withdrawal", bank_code, account_number, account_name, amount: (requestedAmount * 100).toString(), transaction_reference: transferRef, currency_id: "NGN" },
-        { headers: { Authorization: `Bearer ${process.env.SQUAD_SECRET_KEY}`, 'Content-Type': 'application/json' } }
+    const aa =
+      Buffer.from(
+        String(a),
+        "utf8"
       );
 
-      await db.collection('apps').doc(app_id).collection('withdrawals').doc(transferRef).set({
-        transferRef, userId: user_id, requestedAmount, fee, totalDeducted: totalDeduction, bankCode: bank_code, accountNumber: account_number, accountName: account_name, status: 'success', createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+    const bb =
+      Buffer.from(
+        String(b),
+        "utf8"
+      );
 
-      return res.status(200).json({ success: true, message: "Withdrawal processed.", amountSent: requestedAmount, feeCharged: fee, transferRef });
-    } catch (payoutError) {
-      await userRef.update({ walletBalance: admin.firestore.FieldValue.increment(totalDeduction) });
-      return res.status(502).json({ error: "Payout failed. Wallet refunded.", details: payoutError.response?.data?.message || payoutError.message });
+    if (
+      aa.length !==
+      bb.length
+    ) {
+      return false;
     }
-  } catch (error) {
-    return res.status(400).json({ error: error.message });
+
+    return crypto.timingSafeEqual(
+      aa,
+      bb
+    );
+
+  } catch {
+
+    return false;
+
   }
-});
+
+}
+
 
 /**
- * ADMIN STATS: View summary of users and system health
+ * Normalize Firebase private key.
  */
-app.get('/api/admin/stats', async (req, res) => {
+function normalizePrivateKey(key) {
+
+  return String(key)
+    .replace(/\\n/g, "\n");
+
+}
+
+
+/* ============================================================
+   FIREBASE AUTHENTICATION
+   ============================================================ */
+
+async function authenticateFirebaseUser(
+  req,
+  res,
+  next
+) {
+
   try {
-    const appId = req.query.app_id || 'nairamaster';
-    
-    // Using simple count queries for performance
-    const usersSnapshot = await db.collection('apps').doc(appId).collection('users').count().get();
-    const transactionsSnapshot = await db.collection('apps').doc(appId).collection('transactions').count().get();
+
+    const authorization =
+      req.headers.authorization || "";
+
+    if (
+      !authorization.startsWith(
+        "Bearer "
+      )
+    ) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Firebase authentication token is required."
+
+      });
+
+    }
+
+    const token =
+      authorization
+        .substring(7)
+        .trim();
+
+    const decoded =
+      await admin
+        .auth()
+        .verifyIdToken(token);
+
+    req.user =
+      decoded;
+
+    next();
+
+  } catch (error) {
+
+    console.error(
+      "Firebase authentication error:",
+      error
+    );
+
+    return res.status(401).json({
+
+      success: false,
+
+      message:
+        "Invalid or expired Firebase authentication token."
+
+    });
+
+  }
+
+}
+
+
+/* ============================================================
+   SQUAD API REQUEST
+   ============================================================ */
+
+async function squadRequest(
+  endpoint,
+  options = {}
+) {
+
+  const response =
+    await fetch(
+      SQUAD_BASE_URL + endpoint,
+      {
+
+        method:
+          options.method || "GET",
+
+        headers: {
+
+          "Authorization":
+            `Bearer ${process.env.SQUAD_SECRET_KEY}`,
+
+          "Content-Type":
+            "application/json",
+
+          ...(options.headers || {})
+
+        },
+
+        body:
+          options.body
+            ? JSON.stringify(
+                options.body
+              )
+            : undefined
+
+      }
+    );
+
+
+  const text =
+    await response.text();
+
+  let data;
+
+  try {
+
+    data =
+      JSON.parse(text);
+
+  } catch {
+
+    data = {
+      raw: text
+    };
+
+  }
+
+
+  if (
+    !response.ok
+  ) {
+
+    const error =
+      new Error(
+        data?.message ||
+        "Squad API request failed."
+      );
+
+    error.status =
+      response.status;
+
+    error.squadResponse =
+      data;
+
+    throw error;
+
+  }
+
+
+  return data;
+
+}
+
+
+/* ============================================================
+   SQUAD PAYMENT INITIALIZATION
+   ============================================================ */
+
+async function createSquadCheckout({
+
+  amountKobo,
+
+  email,
+
+  customerName,
+
+  reference,
+
+  callbackUrl,
+
+  metadata
+
+}) {
+
+  const channels =
+    (
+      process.env.SQUAD_PAYMENT_CHANNELS ||
+      "card,bank,ussd,transfer"
+    )
+      .split(",")
+      .map(
+        x => x.trim()
+      )
+      .filter(Boolean);
+
+
+  const payload = {
+
+    amount:
+      amountKobo,
+
+    email:
+      email,
+
+    currency:
+      "NGN",
+
+    initiate_type:
+      "inline",
+
+    transaction_ref:
+      reference,
+
+    customer_name:
+      customerName,
+
+    callback_url:
+      callbackUrl,
+
+    payment_channels:
+      channels,
+
+    metadata:
+      metadata,
+
+    pass_charge:
+      process.env.SQUAD_PASS_CHARGE === "true"
+
+  };
+
+
+  const response =
+    await squadRequest(
+      "/transaction/initiate",
+      {
+
+        method:
+          "POST",
+
+        body:
+          payload
+
+      }
+    );
+
+
+  const data =
+    response?.data ||
+    response;
+
+
+  const checkoutUrl =
+    data?.checkout_url ||
+    data?.checkoutUrl;
+
+
+  if (!checkoutUrl) {
+
+    throw new Error(
+      "Squad did not return checkout_url."
+    );
+
+  }
+
+
+  return {
+
+    checkoutUrl,
+
+    transactionRef:
+      data?.transaction_ref ||
+      reference,
+
+    response
+
+  };
+
+}
+
+
+/* ============================================================
+   ADD MONEY
+   ============================================================ */
+
+/*
+ * POST
+ *
+ * /api/payments/add-money
+ *
+ * Body:
+ *
+ * {
+ *   "amount": 5000
+ * }
+ */
+
+app.post(
+  "/api/payments/add-money",
+  authenticateFirebaseUser,
+  async (req, res) => {
+
+    try {
+
+      const uid =
+        req.user.uid;
+
+      const email =
+        req.user.email ||
+        req.body.email;
+
+      const customerName =
+        req.body.customerName ||
+        req.user.name ||
+        "Naira Master User";
+
+
+      if (!email) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Customer email is required."
+
+        });
+
+      }
+
+
+      const amountNaira =
+        Number(
+          req.body.amount
+        );
+
+
+      const amountKobo =
+        nairaToKobo(
+          amountNaira
+        );
+
+
+      const reference =
+        generateReference(
+          "NM_WALLET"
+        );
+
+
+      const paymentRef =
+        db
+          .collection(
+            "squadPayments"
+          )
+          .doc(reference);
+
+
+      await paymentRef.create({
+
+        reference,
+
+        uid,
+
+        email,
+
+        customerName,
+
+        amountNaira,
+
+        amountKobo,
+
+        currency:
+          "NGN",
+
+        purpose:
+          "wallet_funding",
+
+        status:
+          "pending",
+
+        credited:
+          false,
+
+        createdAt:
+          FieldValue.serverTimestamp(),
+
+        updatedAt:
+          FieldValue.serverTimestamp()
+
+      });
+
+
+      const callbackUrl =
+        process.env.FRONTEND_URL
+          ? (
+              process.env.FRONTEND_URL
+                .replace(/\/$/, "") +
+              "/?payment=squad-complete"
+            )
+          : undefined;
+
+
+      const checkout =
+        await createSquadCheckout({
+
+          amountKobo,
+
+          email,
+
+          customerName,
+
+          reference,
+
+          callbackUrl,
+
+          metadata: {
+
+            uid,
+
+            purpose:
+              "wallet_funding",
+
+            naira_master_reference:
+              reference
+
+          }
+
+        });
+
+
+      await paymentRef.update({
+
+        checkoutUrl:
+          checkout.checkoutUrl,
+
+        squadReference:
+          checkout.transactionRef,
+
+        squadInitializeResponse:
+          checkout.response,
+
+        updatedAt:
+          FieldValue.serverTimestamp()
+
+      });
+
+
+      return res.json({
+
+        success: true,
+
+        reference,
+
+        checkoutUrl:
+          checkout.checkoutUrl,
+
+        amount:
+          amountNaira,
+
+        currency:
+          "NGN"
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "ADD MONEY ERROR:",
+        error
+      );
+
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to initialize Add Money payment."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   PAYMENT STATUS
+   ============================================================ */
+
+app.get(
+  "/api/payments/status/:reference",
+  authenticateFirebaseUser,
+  async (req, res) => {
+
+    try {
+
+      const reference =
+        String(
+          req.params.reference
+        );
+
+
+      const snapshot =
+        await db
+          .collection(
+            "squadPayments"
+          )
+          .doc(reference)
+          .get();
+
+
+      if (
+        !snapshot.exists
+      ) {
+
+        return res.status(404).json({
+
+          success: false,
+
+          message:
+            "Payment not found."
+
+        });
+
+      }
+
+
+      const payment =
+        snapshot.data();
+
+
+      if (
+        payment.uid !==
+        req.user.uid
+      ) {
+
+        return res.status(403).json({
+
+          success: false,
+
+          message:
+            "You are not authorized to view this payment."
+
+        });
+
+      }
+
+
+      return res.json({
+
+        success: true,
+
+        payment: {
+
+          reference,
+
+          amount:
+            payment.amountNaira,
+
+          currency:
+            payment.currency,
+
+          purpose:
+            payment.purpose,
+
+          status:
+            payment.status,
+
+          credited:
+            Boolean(
+              payment.credited
+            ),
+
+          gatewayRef:
+            payment.gatewayRef ||
+            null,
+
+          createdAt:
+            payment.createdAt ||
+            null,
+
+          completedAt:
+            payment.completedAt ||
+            null
+
+        }
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "STATUS ERROR:",
+        error
+      );
+
+
+      res.status(500).json({
+
+        success: false,
+
+        message:
+          "Unable to retrieve payment status."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   SQUAD WEBHOOK SIGNATURE
+   ============================================================ */
+
+/*
+ * Squad documents:
+ *
+ * V1:
+ *   HMAC of entire webhook body.
+ *
+ * V2/V3:
+ *   HMAC of:
+ *
+ * transaction_reference
+ * virtual_account_number
+ * currency
+ * principal_amount
+ * settled_amount
+ * customer_identifier
+ *
+ * separated with |.
+ */
+
+function verifySquadWebhookSignature(
+  rawBody,
+  payload,
+  signature
+) {
+
+  if (
+    !signature
+  ) {
+
+    return false;
+
+  }
+
+
+  const body =
+    payload?.Body ||
+    payload?.body ||
+    payload?.data ||
+    payload;
+
+
+  const transactionReference =
+    payload?.transaction_reference ||
+    body?.transaction_reference ||
+    payload?.TransactionRef ||
+    body?.transaction_ref;
+
+
+  const virtualAccountNumber =
+    payload?.virtual_account_number ||
+    body?.virtual_account_number;
+
+
+  const currency =
+    payload?.currency ||
+    body?.currency;
+
+
+  const principalAmount =
+    payload?.principal_amount ||
+    body?.principal_amount;
+
+
+  const settledAmount =
+    payload?.settled_amount ||
+    body?.settled_amount;
+
+
+  const customerIdentifier =
+    payload?.customer_identifier ||
+    body?.customer_identifier;
+
+
+  const sixFieldsAvailable =
+    transactionReference !== undefined &&
+    virtualAccountNumber !== undefined &&
+    currency !== undefined &&
+    principalAmount !== undefined &&
+    settledAmount !== undefined &&
+    customerIdentifier !== undefined;
+
+
+  /*
+   * Explicit V2/V3 mode.
+   */
+
+  if (
+    WEBHOOK_VERSION === "v2" ||
+    WEBHOOK_VERSION === "v3"
+  ) {
+
+    if (
+      !sixFieldsAvailable
+    ) {
+
+      return false;
+
+    }
+
+
+    const signingString =
+
+      `${transactionReference}|` +
+      `${virtualAccountNumber}|` +
+      `${currency}|` +
+      `${principalAmount}|` +
+      `${settledAmount}|` +
+      `${customerIdentifier}`;
+
+
+    const expected =
+      crypto
+        .createHmac(
+          "sha512",
+          process.env.SQUAD_SECRET_KEY
+        )
+        .update(
+          signingString,
+          "utf8"
+        )
+        .digest(
+          "hex"
+        );
+
+
+    if (
+      safeEqual(
+        expected,
+        signature
+      )
+    ) {
+
+      return true;
+
+    }
+
+
+    /*
+     * Some Squad implementations/docs
+     * use SHA256 examples.
+     *
+     * Try it as compatibility fallback.
+     */
+
+    const expectedSha256 =
+      crypto
+        .createHmac(
+          "sha256",
+          process.env.SQUAD_SECRET_KEY
+        )
+        .update(
+          signingString,
+          "utf8"
+        )
+        .digest(
+          "hex"
+        );
+
+
+    return safeEqual(
+      expectedSha256,
+      signature
+    );
+
+  }
+
+
+  /*
+   * AUTO:
+   *
+   * Try six-field signature first.
+   */
+
+  if (
+    sixFieldsAvailable
+  ) {
+
+    const signingString =
+
+      `${transactionReference}|` +
+      `${virtualAccountNumber}|` +
+      `${currency}|` +
+      `${principalAmount}|` +
+      `${settledAmount}|` +
+      `${customerIdentifier}`;
+
+
+    const sha512 =
+      crypto
+        .createHmac(
+          "sha512",
+          process.env.SQUAD_SECRET_KEY
+        )
+        .update(
+          signingString
+        )
+        .digest(
+          "hex"
+        );
+
+
+    if (
+      safeEqual(
+        sha512,
+        signature
+      )
+    ) {
+
+      return true;
+
+    }
+
+
+    const sha256 =
+      crypto
+        .createHmac(
+          "sha256",
+          process.env.SQUAD_SECRET_KEY
+        )
+        .update(
+          signingString
+        )
+        .digest(
+          "hex"
+        );
+
+
+    if (
+      safeEqual(
+        sha256,
+        signature
+      )
+    ) {
+
+      return true;
+
+    }
+
+  }
+
+
+  /*
+   * V1 fallback:
+   *
+   * Entire raw webhook body.
+   */
+
+  const bodyHash =
+    crypto
+      .createHmac(
+        "sha512",
+        process.env.SQUAD_SECRET_KEY
+      )
+      .update(
+        rawBody
+      )
+      .digest(
+        "hex"
+      );
+
+
+  if (
+    safeEqual(
+      bodyHash,
+      signature
+    )
+  ) {
+
+    return true;
+
+  }
+
+
+  const bodyHashSha256 =
+    crypto
+      .createHmac(
+        "sha256",
+        process.env.SQUAD_SECRET_KEY
+      )
+      .update(
+        rawBody
+      )
+      .digest(
+        "hex"
+      );
+
+
+  return safeEqual(
+    bodyHashSha256,
+    signature
+  );
+
+}
+
+
+/* ============================================================
+   EXTRACT NORMAL CHECKOUT WEBHOOK
+   ============================================================ */
+
+function extractCheckoutWebhook(
+  payload
+) {
+
+  const body =
+    payload?.Body ||
+    payload?.body ||
+    payload?.data ||
+    payload;
+
+
+  return {
+
+    event:
+      payload?.Event ||
+      payload?.event ||
+      null,
+
+    reference:
+      body?.transaction_ref ||
+      payload?.TransactionRef ||
+      payload?.transaction_reference ||
+      null,
+
+    status:
+      body?.transaction_status ||
+      body?.status ||
+      payload?.transaction_status ||
+      payload?.status ||
+      null,
+
+    amountKobo:
+      Number(
+        body?.amount ||
+        body?.principal_amount ||
+        0
+      ),
+
+    currency:
+      body?.currency ||
+      payload?.currency ||
+      "NGN",
+
+    gatewayRef:
+      body?.gateway_ref ||
+      body?.gateway_transaction_ref ||
+      null,
+
+    metadata:
+      body?.meta ||
+      body?.metadata ||
+      payload?.meta ||
+      payload?.metadata ||
+      {}
+
+  };
+
+}
+
+
+/* ============================================================
+   CREDIT WALLET
+   ============================================================ */
+
+async function creditWalletFromPayment(
+  paymentReference,
+  webhook
+) {
+
+  const paymentDoc =
+    db
+      .collection(
+        "squadPayments"
+      )
+      .doc(
+        paymentReference
+      );
+
+
+  return db.runTransaction(
+    async transaction => {
+
+      const paymentSnapshot =
+        await transaction.get(
+          paymentDoc
+        );
+
+
+      if (
+        !paymentSnapshot.exists
+      ) {
+
+        return {
+
+          found:
+            false,
+
+          alreadyProcessed:
+            false
+
+        };
+
+      }
+
+
+      const payment =
+        paymentSnapshot.data();
+
+
+      /*
+       * DUPLICATE PROTECTION
+       */
+
+      if (
+        payment.credited === true ||
+        payment.status ===
+          "successful"
+      ) {
+
+        return {
+
+          found:
+            true,
+
+          alreadyProcessed:
+            true,
+
+          uid:
+            payment.uid,
+
+          amount:
+            payment.amountNaira
+
+        };
+
+      }
+
+
+      /*
+       * STATUS CHECK
+       */
+
+      const status =
+        String(
+          webhook.status ||
+          webhook.event ||
+          ""
+        ).toLowerCase();
+
+
+      const successful =
+
+        status ===
+          "success" ||
+
+        status ===
+          "successful" ||
+
+        status ===
+          "charge_successful";
+
+
+      if (
+        !successful
+      ) {
+
+        transaction.update(
+          paymentDoc,
+          {
+
+            status:
+              "failed",
+
+            squadStatus:
+              webhook.status ||
+              null,
+
+            updatedAt:
+              FieldValue.serverTimestamp()
+
+          }
+        );
+
+
+        return {
+
+          found:
+            true,
+
+          alreadyProcessed:
+            false,
+
+          successful:
+            false,
+
+          uid:
+            payment.uid,
+
+          amount:
+            payment.amountNaira
+
+        };
+
+      }
+
+
+      /*
+       * CURRENCY CHECK
+       */
+
+      if (
+        String(
+          webhook.currency
+        ).toUpperCase() !==
+        "NGN"
+      ) {
+
+        throw new Error(
+          "Payment currency is not NGN."
+        );
+
+      }
+
+
+      /*
+       * AMOUNT CHECK
+       */
+
+      if (
+        Number(
+          webhook.amountKobo
+        ) !==
+        Number(
+          payment.amountKobo
+        )
+      ) {
+
+        throw new Error(
+
+          "Payment amount mismatch."
+
+        );
+
+      }
+
+
+      const userDoc =
+        db
+          .collection(
+            "users"
+          )
+          .doc(
+            payment.uid
+          );
+
+
+      const userSnapshot =
+        await transaction.get(
+          userDoc
+        );
+
+
+      if (
+        !userSnapshot.exists
+      ) {
+
+        throw new Error(
+          "Naira Master user does not exist."
+        );
+
+      }
+
+
+      const user =
+        userSnapshot.data() ||
+        {};
+
+
+      const oldBalance =
+        Number(
+          user.balance || 0
+        );
+
+
+      const creditAmount =
+        Number(
+          payment.amountNaira
+        );
+
+
+      const newBalance =
+        oldBalance +
+        creditAmount;
+
+
+      /*
+       * WALLET UPDATE
+       */
+
+      transaction.update(
+        userDoc,
+        {
+
+          balance:
+            newBalance,
+
+          updatedAt:
+            FieldValue.serverTimestamp()
+
+        }
+      );
+
+
+      /*
+       * TRANSACTION RECORD
+       */
+
+      const transactionDoc =
+        db
+          .collection(
+            "transactions"
+          )
+          .doc(
+            paymentReference
+          );
+
+
+      transaction.set(
+        transactionDoc,
+        {
+
+          uid:
+            payment.uid,
+
+          type:
+            "credit",
+
+          category:
+            "wallet_funding",
+
+          purpose:
+            "Add Money",
+
+          amount:
+            creditAmount,
+
+          currency:
+            "NGN",
+
+          status:
+            "Successful",
+
+          reference:
+            paymentReference,
+
+          gatewayRef:
+            webhook.gatewayRef ||
+            null,
+
+          previousBalance:
+            oldBalance,
+
+          newBalance:
+            newBalance,
+
+          source:
+            "Squad",
+
+          createdAt:
+            FieldValue.serverTimestamp()
+
+        }
+      );
+
+
+      /*
+       * PAYMENT RECORD
+       */
+
+      transaction.update(
+        paymentDoc,
+        {
+
+          status:
+            "successful",
+
+          credited:
+            true,
+
+          gatewayRef:
+            webhook.gatewayRef ||
+            null,
+
+          completedAt:
+            FieldValue.serverTimestamp(),
+
+          updatedAt:
+            FieldValue.serverTimestamp()
+
+        }
+      );
+
+
+      return {
+
+        found:
+          true,
+
+        alreadyProcessed:
+          false,
+
+        successful:
+          true,
+
+        uid:
+          payment.uid,
+
+        amount:
+          creditAmount,
+
+        newBalance
+
+      };
+
+    }
+  );
+
+}
+
+
+/* ============================================================
+   SQUAD WEBHOOK
+   ============================================================ */
+
+async function squadWebhook(
+  req,
+  res
+) {
+
+  const rawBody =
+    Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(
+          req.body || ""
+        );
+
+
+  let payload;
+
+
+  try {
+
+    payload =
+      JSON.parse(
+        rawBody.toString(
+          "utf8"
+        )
+      );
+
+  } catch {
+
+    return res.status(400).json({
+
+      response_code:
+        400,
+
+      response_description:
+        "Invalid JSON"
+
+    });
+
+  }
+
+
+  const signatureHeader =
+    req.headers[
+      "x-squad-signature"
+    ];
+
+
+  const signature =
+    Array.isArray(
+      signatureHeader
+    )
+      ? signatureHeader[0]
+      : signatureHeader;
+
+
+  const valid =
+    verifySquadWebhookSignature(
+      rawBody,
+      payload,
+      signature
+    );
+
+
+  if (
+    !valid
+  ) {
+
+    console.warn(
+      "Rejected Squad webhook: invalid signature."
+    );
+
+
+    return res.status(401).json({
+
+      response_code:
+        400,
+
+      response_description:
+        "Invalid webhook signature"
+
+    });
+
+  }
+
+
+  try {
+
+    const webhook =
+      extractCheckoutWebhook(
+        payload
+      );
+
+
+    if (
+      !webhook.reference
+    ) {
+
+      return res.status(400).json({
+
+        response_code:
+          400,
+
+        response_description:
+          "Transaction reference missing"
+
+      });
+
+    }
+
+
+    const result =
+      await creditWalletFromPayment(
+        webhook.reference,
+        webhook
+      );
+
+
+    /*
+     * Squad expects a successful acknowledgement.
+     */
 
     return res.status(200).json({
-      success: true,
-      stats: {
-        total_users: usersSnapshot.data().count,
-        total_transactions: transactionsSnapshot.data().count,
-        timestamp: new Date().toISOString()
-      }
+
+      response_code:
+        200,
+
+      transaction_reference:
+        webhook.reference,
+
+      response_description:
+        result.alreadyProcessed
+          ? "Already processed"
+          : "Success"
+
     });
+
   } catch (error) {
-    return res.status(500).json({ error: "Failed to fetch admin stats." });
+
+    console.error(
+      "SQUAD WEBHOOK ERROR:",
+      error
+    );
+
+
+    return res.status(500).json({
+
+      response_code:
+        500,
+
+      response_description:
+        "System malfunction"
+
+    });
+
   }
-});
 
-// -----------------------------------------------------------------------------
-// 5. SERVER STARTUP
-// -----------------------------------------------------------------------------
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`====================================================`);
-  console.log(` Central Server running on port ${PORT}`);
-  console.log(` Webhook URL: /api/webhooks/squad`);
-  console.log(`====================================================`);
-});
+}
 
-// Secure Addition: Bank Account Lookup Route
-app.post('/api/payout/account-lookup', async (req, res) => {
-  try {
-    const { bank_code, account_number } = req.body;
-    if (!bank_code || !account_number) {
-      return res.status(400).json({ error: 'bank_code and account_number are required.' });
+
+/* ============================================================
+   CREATE TASK PAYMENT
+   ============================================================ */
+
+/*
+ * Existing Naira Master source uses:
+ *
+ * TASK CREATION FEE = ₦1,000
+ *
+ * We keep this configurable through ENV.
+ */
+
+const TASK_CREATION_FEE =
+  Number(
+    process.env.TASK_CREATION_FEE ||
+    1000
+  );
+
+
+app.post(
+  "/api/payments/create-task",
+  authenticateFirebaseUser,
+  async (req, res) => {
+
+    try {
+
+      const uid =
+        req.user.uid;
+
+      const email =
+        req.user.email ||
+        req.body.email;
+
+
+      if (!email) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Customer email is required."
+
+        });
+
+      }
+
+
+      const taskPayload =
+        req.body.taskPayload;
+
+
+      if (
+        !taskPayload ||
+        typeof taskPayload !==
+          "object"
+      ) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "taskPayload is required."
+
+        });
+
+      }
+
+
+      const amountNaira =
+        TASK_CREATION_FEE;
+
+
+      const amountKobo =
+        nairaToKobo(
+          amountNaira
+        );
+
+
+      const reference =
+        generateReference(
+          "NM_TASK"
+        );
+
+
+      const paymentDoc =
+        db
+          .collection(
+            "squadPayments"
+          )
+          .doc(
+            reference
+          );
+
+
+      await paymentDoc.create({
+
+        reference,
+
+        uid,
+
+        email,
+
+        amountNaira,
+
+        amountKobo,
+
+        currency:
+          "NGN",
+
+        purpose:
+          "task_creation",
+
+        status:
+          "pending",
+
+        credited:
+          false,
+
+        taskPayload,
+
+        createdAt:
+          FieldValue.serverTimestamp(),
+
+        updatedAt:
+          FieldValue.serverTimestamp()
+
+      });
+
+
+      const callbackUrl =
+        process.env.FRONTEND_URL
+          ? (
+              process.env.FRONTEND_URL
+                .replace(/\/$/, "") +
+              "/?payment=task-complete"
+            )
+          : undefined;
+
+
+      const checkout =
+        await createSquadCheckout({
+
+          amountKobo,
+
+          email,
+
+          customerName:
+            req.user.name ||
+            "Naira Master User",
+
+          reference,
+
+          callbackUrl,
+
+          metadata: {
+
+            uid,
+
+            purpose:
+              "task_creation",
+
+            naira_master_reference:
+              reference
+
+          }
+
+        });
+
+
+      await paymentDoc.update({
+
+        checkoutUrl:
+          checkout.checkoutUrl,
+
+        squadReference:
+          checkout.transactionRef,
+
+        updatedAt:
+          FieldValue.serverTimestamp()
+
+      });
+
+
+      return res.json({
+
+        success: true,
+
+        reference,
+
+        checkoutUrl:
+          checkout.checkoutUrl,
+
+        amount:
+          amountNaira
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "TASK PAYMENT ERROR:",
+        error
+      );
+
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to initialize task payment."
+
+      });
+
     }
-    const response = await axios.get('https://api.squadco.com/payout/account/lookup', {
-      params: { bank_code, account_number },
-      headers: {
-        'Authorization': `Bearer ${process.env.SQUAD_SECRET_KEY}`,
-        'Content-Type': 'application/json'
-      }
-    });
-    res.json(response.data);
-  } catch (error) {
-    res.status(error.response?.status || 500).json({
-      error: 'Failed to lookup account.',
-      details: error.response?.data || error.message
-    });
+
   }
-});
+);
+
+
+/* ============================================================
+   VIRTUAL ACCOUNT — CREATE
+   ============================================================ */
+
+/*
+ * IMPORTANT:
+ *
+ * Squad requires certain customer information for B2C
+ * virtual-account creation, including BVN and other
+ * identifying information.
+ *
+ * The Naira Master frontend should NEVER send the
+ * Squad secret key.
+ *
+ * This endpoint authenticates the Firebase user and
+ * calls Squad server-side.
+ */
+
+app.post(
+  "/api/virtual-accounts/create",
+  authenticateFirebaseUser,
+  async (req, res) => {
+
+    try {
+
+      const uid =
+        req.user.uid;
+
+
+      const {
+
+        firstName,
+
+        lastName,
+
+        middleName,
+
+        mobileNumber,
+
+        dob,
+
+        bvn,
+
+        gender,
+
+        address,
+
+        beneficiaryAccount
+
+      } = req.body;
+
+
+      if (
+        !firstName ||
+        !lastName ||
+        !mobileNumber ||
+        !dob ||
+        !bvn ||
+        !gender ||
+        !address
+      ) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Required virtual-account information is missing."
+
+        });
+
+      }
+
+
+      const customerIdentifier =
+        `NM_${uid}`;
+
+
+      const squadResponse =
+        await squadRequest(
+          "/virtual-account",
+          {
+
+            method:
+              "POST",
+
+            body: {
+
+              customer_identifier:
+                customerIdentifier,
+
+              first_name:
+                firstName,
+
+              last_name:
+                lastName,
+
+              middle_name:
+                middleName,
+
+              mobile_num:
+                mobileNumber,
+
+              email:
+                req.user.email ||
+                req.body.email,
+
+              bvn,
+
+              dob,
+
+              gender,
+
+              address,
+
+              beneficiary_account:
+                beneficiaryAccount ||
+                process.env.SQUAD_BENEFICIARY_ACCOUNT ||
+                undefined
+
+            }
+
+          }
+        );
+
+
+      const account =
+        squadResponse?.data ||
+        {};
+
+
+      /*
+       * Save virtual-account information
+       * against Firebase UID.
+       */
+
+      await db
+        .collection(
+          "users"
+        )
+        .doc(uid)
+        .set(
+
+          {
+
+            squadVirtualAccount: {
+
+              customerIdentifier,
+
+              accountNumber:
+                account.virtual_account_number ||
+                null,
+
+              bankCode:
+                account.bank_code ||
+                null,
+
+              beneficiaryAccount:
+                account.beneficiary_account ||
+                null,
+
+              createdAt:
+                FieldValue.serverTimestamp()
+
+            }
+
+          },
+
+          {
+            merge:
+              true
+          }
+
+        );
+
+
+      return res.json({
+
+        success: true,
+
+        customerIdentifier,
+
+        virtualAccount:
+
+          account.virtual_account_number ||
+          null,
+
+        bankCode:
+          account.bank_code ||
+          null,
+
+        beneficiaryAccount:
+          account.beneficiary_account ||
+          null
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "VIRTUAL ACCOUNT CREATE ERROR:",
+        error
+      );
+
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to create virtual account.",
+
+        squad:
+          error.squadResponse ||
+          null
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   VIRTUAL ACCOUNT — GET BY CUSTOMER IDENTIFIER
+   ============================================================ */
+
+app.get(
+  "/api/virtual-accounts/me",
+  authenticateFirebaseUser,
+  async (req, res) => {
+
+    try {
+
+      const customerIdentifier =
+        `NM_${req.user.uid}`;
+
+
+      const response =
+        await squadRequest(
+          `/virtual-account/${encodeURIComponent(
+            customerIdentifier
+          )}`
+        );
+
+
+      return res.json({
+
+        success: true,
+
+        data:
+          response?.data ||
+          response
+
+      });
+
+    } catch (error) {
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Virtual account not found."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   VIRTUAL ACCOUNT — GET BY ACCOUNT NUMBER
+   ============================================================ */
+
+app.get(
+  "/api/virtual-accounts/account/:accountNumber",
+  authenticateFirebaseUser,
+  async (req, res) => {
+
+    try {
+
+      const accountNumber =
+        String(
+          req.params.accountNumber
+        );
+
+
+      const response =
+        await squadRequest(
+          `/virtual-account/customer/${encodeURIComponent(
+            accountNumber
+          )}`
+        );
+
+
+      return res.json({
+
+        success: true,
+
+        data:
+          response?.data ||
+          response
+
+      });
+
+    } catch (error) {
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Virtual account not found."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   VIRTUAL ACCOUNT — CUSTOMER TRANSACTIONS
+   ============================================================ */
+
+app.get(
+  "/api/virtual-accounts/transactions",
+  authenticateFirebaseUser,
+  async (req, res) => {
+
+    try {
+
+      const customerIdentifier =
+        `NM_${req.user.uid}`;
+
+
+      const response =
+        await squadRequest(
+
+          `/virtual-account/customer/transactions/${encodeURIComponent(
+            customerIdentifier
+          )}`
+
+        );
+
+
+      return res.json({
+
+        success: true,
+
+        data:
+          response?.data ||
+          []
+
+      });
+
+    } catch (error) {
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to retrieve virtual-account transactions."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   MERCHANT VIRTUAL ACCOUNTS
+   ============================================================ */
+
+app.get(
+  "/api/virtual-accounts/merchant/accounts",
+  async (req, res) => {
+
+    try {
+
+      const query =
+        new URLSearchParams();
+
+
+      if (
+        req.query.page
+      ) {
+
+        query.set(
+          "page",
+          req.query.page
+        );
+
+      }
+
+
+      if (
+        req.query.perPage
+      ) {
+
+        query.set(
+          "perPage",
+          req.query.perPage
+        );
+
+      }
+
+
+      if (
+        req.query.startDate
+      ) {
+
+        query.set(
+          "startDate",
+          req.query.startDate
+        );
+
+      }
+
+
+      if (
+        req.query.endDate
+      ) {
+
+        query.set(
+          "endDate",
+          req.query.endDate
+        );
+
+      }
+
+
+      const response =
+        await squadRequest(
+
+          `/virtual-account/merchant/accounts?${query.toString()}`
+
+        );
+
+
+      return res.json({
+
+        success: true,
+
+        data:
+          response?.data ||
+          response
+
+      });
+
+    } catch (error) {
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to retrieve merchant virtual accounts."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   MERCHANT VIRTUAL ACCOUNT TRANSACTIONS
+   ============================================================ */
+
+app.get(
+  "/api/virtual-accounts/merchant/transactions",
+  async (req, res) => {
+
+    try {
+
+      const response =
+        await squadRequest(
+          "/virtual-account/merchant/transactions"
+        );
+
+
+      return res.json({
+
+        success: true,
+
+        data:
+          response?.data ||
+          response
+
+      });
+
+    } catch (error) {
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to retrieve merchant transactions."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   MERCHANT VIRTUAL ACCOUNT TRANSACTIONS — FILTERED
+   ============================================================ */
+
+app.get(
+  "/api/virtual-accounts/merchant/transactions/all",
+  async (req, res) => {
+
+    try {
+
+      const allowed = [
+
+        "page",
+
+        "perPage",
+
+        "virtualAccount",
+
+        "customerIdentifier",
+
+        "startDate",
+
+        "endDate",
+
+        "transactionReference",
+
+        "session_id",
+
+        "dir"
+
+      ];
+
+
+      const query =
+        new URLSearchParams();
+
+
+      for (
+        const key of allowed
+      ) {
+
+        if (
+          req.query[key] !==
+          undefined
+        ) {
+
+          query.set(
+            key,
+            req.query[key]
+          );
+
+        }
+
+      }
+
+
+      const response =
+        await squadRequest(
+
+          `/virtual-account/merchant/transactions/all?${query.toString()}`
+
+        );
+
+
+      return res.json({
+
+        success: true,
+
+        data:
+          response?.data ||
+          response
+
+      });
+
+    } catch (error) {
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to retrieve filtered merchant transactions."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   VIRTUAL ACCOUNT WEBHOOK ERROR LOG
+   ============================================================ */
+
+app.get(
+  "/api/virtual-accounts/webhook-logs",
+  async (req, res) => {
+
+    try {
+
+      const query =
+        new URLSearchParams();
+
+
+      if (
+        req.query.page
+      ) {
+
+        query.set(
+          "page",
+          req.query.page
+        );
+
+      }
+
+
+      if (
+        req.query.perPage
+      ) {
+
+        query.set(
+          "perPage",
+          req.query.perPage
+        );
+
+      }
+
+
+      const response =
+        await squadRequest(
+
+          `/virtual-account/webhook/logs?${query.toString()}`
+
+        );
+
+
+      return res.json({
+
+        success: true,
+
+        data:
+          response?.data ||
+          response
+
+      });
+
+    } catch (error) {
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to retrieve webhook error logs."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   DELETE PROCESSED WEBHOOK ERROR
+   ============================================================ */
+
+app.delete(
+  "/api/virtual-accounts/webhook-logs/:transactionReference",
+  async (req, res) => {
+
+    try {
+
+      const reference =
+        encodeURIComponent(
+          req.params.transactionReference
+        );
+
+
+      const response =
+        await squadRequest(
+
+          `/virtual-account/webhook/logs/${reference}`,
+
+          {
+
+            method:
+              "DELETE"
+
+          }
+
+        );
+
+
+      return res.json({
+
+        success: true,
+
+        data:
+          response?.data ||
+          response
+
+      });
+
+    } catch (error) {
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to delete webhook log."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   QUERY SQUAD TRANSACTION
+   ============================================================ */
+
+/*
+ * Squad's transaction API requires dates.
+ *
+ * This endpoint is intentionally server-side.
+ */
+
+app.get(
+  "/api/squad/transactions",
+  authenticateFirebaseUser,
+  async (req, res) => {
+
+    try {
+
+      const today =
+        new Date();
+
+      const endDate =
+        req.query.end_date ||
+        today
+          .toISOString()
+          .slice(
+            0,
+            10
+          );
+
+
+      const startDate =
+        req.query.start_date ||
+        new Date(
+          today.getTime() -
+          30 *
+          24 *
+          60 *
+          60 *
+          1000
+        )
+          .toISOString()
+          .slice(
+            0,
+            10
+          );
+
+
+      const query =
+        new URLSearchParams({
+
+          start_date:
+            startDate,
+
+          end_date:
+            endDate
+
+        });
+
+
+      if (
+        req.query.reference
+      ) {
+
+        query.set(
+          "reference",
+          req.query.reference
+        );
+
+      }
+
+
+      if (
+        req.query.page
+      ) {
+
+        query.set(
+          "page",
+          req.query.page
+        );
+
+      }
+
+
+      if (
+        req.query.perpage
+      ) {
+
+        query.set(
+          "perpage",
+          req.query.perpage
+        );
+
+      }
+
+
+      const response =
+        await squadRequest(
+
+          `/transaction?${query.toString()}`
+
+        );
+
+
+      return res.json({
+
+        success: true,
+
+        data:
+          response?.data ||
+          response
+
+      });
+
+    } catch (error) {
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to query Squad transactions."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   GLOBAL 404
+   ============================================================ */
+
+app.use(
+  (_req, res) => {
+
+    res.status(404).json({
+
+      success: false,
+
+      message:
+        "Naira Master API route not found."
+
+    });
+
+  }
+);
+
+
+/* ============================================================
+   GLOBAL ERROR HANDLER
+   ============================================================ */
+
+app.use(
+  (error, _req, res, _next) => {
+
+    console.error(
+      "GLOBAL SERVER ERROR:",
+      error
+    );
+
+
+    res.status(500).json({
+
+      success: false,
+
+      message:
+        "Internal server error."
+
+    });
+
+  }
+);
+
+
+/* ============================================================
+   START SERVER
+   ============================================================ */
+
+app.listen(
+  PORT,
+  () => {
+
+    console.log(
+      "================================================"
+    );
+
+    console.log(
+      "NAIRA MASTER HGT SQUAD SERVER"
+    );
+
+    console.log(
+      "================================================"
+    );
+
+    console.log(
+      `Port: ${PORT}`
+    );
+
+    console.log(
+      `Environment: ${NODE_ENV}`
+    );
+
+    console.log(
+      `Squad environment: ${SQUAD_ENV}`
+    );
+
+    console.log(
+      `Squad API: ${SQUAD_BASE_URL}`
+    );
+
+    console.log(
+      "Server is running."
+    );
+
+    console.log(
+      "================================================"
+    );
+
+  }
+);
