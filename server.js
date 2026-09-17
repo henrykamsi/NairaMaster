@@ -898,6 +898,15 @@ app.get(
             payment.gatewayRef ||
             null,
 
+          taskCreated:
+            Boolean(
+              payment.taskCreated
+            ),
+
+          taskId:
+            payment.taskId ||
+            null,
+
           createdAt:
             payment.createdAt ||
             null,
@@ -924,6 +933,393 @@ app.get(
 
         message:
           "Unable to retrieve payment status."
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ============================================================
+   CREATE TASK PAYMENT
+   ============================================================ */
+
+/*
+ * Task creation payment:
+ *
+ * User enters:
+ *
+ *   title
+ *   description
+ *   category
+ *   socialMedia
+ *   link
+ *
+ * The server creates a ₦1,000 Squad checkout.
+ *
+ * IMPORTANT:
+ *
+ * The task is NOT created here.
+ *
+ * The task is created only after Squad sends a
+ * verified successful webhook.
+ */
+
+const TASK_CREATION_FEE =
+  Number(
+    process.env.TASK_CREATION_FEE ||
+    1000
+  );
+
+const MAX_TASK_PERFORMERS =
+  25;
+
+const TASK_DISTRIBUTION_AMOUNT =
+  700;
+
+
+app.post(
+  "/api/payments/create-task",
+  authenticateFirebaseUser,
+  async (req, res) => {
+
+    try {
+
+      const uid =
+        req.user.uid;
+
+      const email =
+        req.user.email ||
+        req.body.email;
+
+
+      if (!email) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Customer email is required."
+
+        });
+
+      }
+
+
+      const taskPayload =
+        req.body.taskPayload;
+
+
+      if (
+        !taskPayload ||
+        typeof taskPayload !==
+          "object"
+      ) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "taskPayload is required."
+
+        });
+
+      }
+
+
+      /*
+       * REQUIRED TASK FIELDS
+       */
+
+      const title =
+        String(
+          taskPayload.title ||
+          ""
+        ).trim();
+
+      const description =
+        String(
+          taskPayload.description ||
+          ""
+        ).trim();
+
+      const category =
+        String(
+          taskPayload.category ||
+          ""
+        ).trim();
+
+      const socialMedia =
+        String(
+          taskPayload.socialMedia ||
+          ""
+        ).trim();
+
+      const link =
+        String(
+          taskPayload.link ||
+          ""
+        ).trim();
+
+
+      if (!title) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Task title is required."
+
+        });
+
+      }
+
+
+      if (!description) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Task description and instructions are required."
+
+        });
+
+      }
+
+
+      if (!category) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Task category is required."
+
+        });
+
+      }
+
+
+      if (!socialMedia) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Social media platform is required."
+
+        });
+
+      }
+
+
+      if (!link) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "Task link is required."
+
+        });
+
+      }
+
+
+      /*
+       * SERVER CONTROLS THE PRICE.
+       *
+       * Frontend cannot change the ₦1,000 fee.
+       */
+
+      const amountNaira =
+        TASK_CREATION_FEE;
+
+
+      const amountKobo =
+        nairaToKobo(
+          amountNaira
+        );
+
+
+      const reference =
+        generateReference(
+          "NM_TASK"
+        );
+
+
+      const paymentDoc =
+        db
+          .collection(
+            "squadPayments"
+          )
+          .doc(
+            reference
+          );
+
+
+      /*
+       * SAVE TASK INFORMATION AS PENDING.
+       *
+       * This is NOT the actual task collection.
+       *
+       * It is only temporary payment information.
+       */
+
+      await paymentDoc.create({
+
+        reference,
+
+        uid,
+
+        email,
+
+        amountNaira,
+
+        amountKobo,
+
+        currency:
+          "NGN",
+
+        purpose:
+          "task_creation",
+
+        status:
+          "pending",
+
+        credited:
+          false,
+
+        taskCreated:
+          false,
+
+        taskPayload: {
+
+          title,
+
+          description,
+
+          category,
+
+          socialMedia,
+
+          link
+
+        },
+
+        createdAt:
+          FieldValue.serverTimestamp(),
+
+        updatedAt:
+          FieldValue.serverTimestamp()
+
+      });
+
+
+      const callbackUrl =
+        process.env.FRONTEND_URL
+          ? (
+              process.env.FRONTEND_URL
+                .replace(/\/$/, "") +
+              "/?payment=task-complete"
+            )
+          : undefined;
+
+
+      const customerName =
+        req.user.name ||
+        "Naira Master User";
+
+
+      const checkout =
+        await createSquadCheckout({
+
+          amountKobo,
+
+          email,
+
+          customerName,
+
+          reference,
+
+          callbackUrl,
+
+          metadata: {
+
+            uid,
+
+            purpose:
+              "task_creation",
+
+            naira_master_reference:
+              reference
+
+          }
+
+        });
+
+
+      await paymentDoc.update({
+
+        checkoutUrl:
+          checkout.checkoutUrl,
+
+        squadReference:
+          checkout.transactionRef,
+
+        updatedAt:
+          FieldValue.serverTimestamp()
+
+      });
+
+
+      return res.json({
+
+        success: true,
+
+        reference,
+
+        checkoutUrl:
+          checkout.checkoutUrl,
+
+        amount:
+          amountNaira,
+
+        currency:
+          "NGN",
+
+        purpose:
+          "task_creation"
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "TASK PAYMENT ERROR:",
+        error
+      );
+
+
+      return res.status(
+        error.status || 400
+      ).json({
+
+        success: false,
+
+        message:
+          error.message ||
+          "Unable to initialize task payment."
 
       });
 
@@ -1667,6 +2063,548 @@ async function creditWalletFromPayment(
 
 
 /* ============================================================
+   CREATE TASK AFTER SUCCESSFUL SQUAD PAYMENT
+   ============================================================ */
+
+/*
+ * IMPORTANT:
+ *
+ * This function is called ONLY after:
+ *
+ * 1. Squad webhook signature is verified.
+ * 2. Payment reference is found in squadPayments.
+ * 3. Payment purpose is task_creation.
+ * 4. Payment status is successful.
+ * 5. Payment amount is exactly ₦1,000.
+ * 6. Payment currency is NGN.
+ *
+ * The task is then created in Firestore.
+ *
+ * The ₦1,000 is NOT credited to the user's wallet.
+ */
+
+async function createTaskAfterSuccessfulPayment(
+  paymentReference,
+  webhook
+) {
+
+  const paymentDoc =
+    db
+      .collection(
+        "squadPayments"
+      )
+      .doc(
+        paymentReference
+      );
+
+
+  return db.runTransaction(
+    async transaction => {
+
+      const paymentSnapshot =
+        await transaction.get(
+          paymentDoc
+        );
+
+
+      if (
+        !paymentSnapshot.exists
+      ) {
+
+        return {
+
+          found:
+            false,
+
+          alreadyProcessed:
+            false
+
+        };
+
+      }
+
+
+      const payment =
+        paymentSnapshot.data();
+
+
+      /*
+       * DUPLICATE PROTECTION
+       *
+       * If the task was already created,
+       * do nothing again.
+       */
+
+      if (
+        payment.taskCreated === true
+      ) {
+
+        return {
+
+          found:
+            true,
+
+          alreadyProcessed:
+            true,
+
+          taskId:
+            payment.taskId ||
+            null
+
+        };
+
+      }
+
+
+      /*
+       * Make sure this is actually a task payment.
+       */
+
+      if (
+        payment.purpose !==
+        "task_creation"
+      ) {
+
+        throw new Error(
+          "Payment is not a task creation payment."
+        );
+
+      }
+
+
+      /*
+       * PAYMENT STATUS
+       */
+
+      const status =
+        String(
+          webhook.status ||
+          webhook.event ||
+          ""
+        ).toLowerCase();
+
+
+      const successful =
+
+        status ===
+          "success" ||
+
+        status ===
+          "successful" ||
+
+        status ===
+          "charge_successful";
+
+
+      if (
+        !successful
+      ) {
+
+        transaction.update(
+          paymentDoc,
+          {
+
+            status:
+              "failed",
+
+            squadStatus:
+              webhook.status ||
+              null,
+
+            updatedAt:
+              FieldValue.serverTimestamp()
+
+          }
+        );
+
+
+        return {
+
+          found:
+            true,
+
+          alreadyProcessed:
+            false,
+
+          successful:
+            false
+
+        };
+
+      }
+
+
+      /*
+       * CURRENCY CHECK
+       */
+
+      if (
+        String(
+          webhook.currency
+        ).toUpperCase() !==
+        "NGN"
+      ) {
+
+        throw new Error(
+          "Task payment currency is not NGN."
+        );
+
+      }
+
+
+      /*
+       * AMOUNT CHECK
+       *
+       * Squad checkout amount is stored in kobo.
+       *
+       * Expected:
+       *
+       * ₦1,000 = 100000 kobo
+       */
+
+      if (
+        Number(
+          webhook.amountKobo
+        ) !==
+        Number(
+          payment.amountKobo
+        )
+      ) {
+
+        throw new Error(
+          "Task payment amount mismatch."
+        );
+
+      }
+
+
+      /*
+       * GET SAVED TASK INFORMATION.
+       */
+
+      const taskPayload =
+        payment.taskPayload ||
+        {};
+
+
+      const title =
+        String(
+          taskPayload.title ||
+          ""
+        ).trim();
+
+      const description =
+        String(
+          taskPayload.description ||
+          ""
+        ).trim();
+
+      const category =
+        String(
+          taskPayload.category ||
+          ""
+        ).trim();
+
+      const socialMedia =
+        String(
+          taskPayload.socialMedia ||
+          ""
+        ).trim();
+
+      const link =
+        String(
+          taskPayload.link ||
+          ""
+        ).trim();
+
+
+      if (!title) {
+
+        throw new Error(
+          "Saved task title is missing."
+        );
+
+      }
+
+
+      if (!description) {
+
+        throw new Error(
+          "Saved task description is missing."
+        );
+
+      }
+
+
+      if (!category) {
+
+        throw new Error(
+          "Saved task category is missing."
+        );
+
+      }
+
+
+      if (!socialMedia) {
+
+        throw new Error(
+          "Saved social media platform is missing."
+        );
+
+      }
+
+
+      if (!link) {
+
+        throw new Error(
+          "Saved task link is missing."
+        );
+
+      }
+
+
+      /*
+       * TASK SETTINGS
+       *
+       * Maximum users that can perform the task:
+       * 25
+       *
+       * Total amount distributed to performers:
+       * ₦700
+       *
+       * Reward per performer:
+       * ₦700 / 25 = ₦28
+       */
+
+      const maxPerformers =
+        MAX_TASK_PERFORMERS;
+
+
+      const distributionAmount =
+        TASK_DISTRIBUTION_AMOUNT;
+
+
+      const rewardPerUser =
+        distributionAmount /
+        maxPerformers;
+
+
+      /*
+       * CREATE THE REAL TASK DOCUMENT.
+       */
+
+      const taskRef =
+        db
+          .collection(
+            "tasks"
+          )
+          .doc();
+
+
+      const taskId =
+        taskRef.id;
+
+
+      const now =
+        new Date().toISOString();
+
+
+      const taskData = {
+
+        taskId,
+
+        title,
+
+        description,
+
+        link,
+
+        socialMedia,
+
+        category,
+
+        tags: [],
+
+        maxPerformers,
+
+        reward:
+          rewardPerUser,
+
+        performerCount:
+          0,
+
+        status:
+          "active",
+
+        visibility:
+          "all",
+
+        tier:
+          "all",
+
+        uploadedByUserId:
+          payment.uid,
+
+        uploadedByAdmin:
+          false,
+
+        paymentReference:
+          paymentReference,
+
+        paymentAmount:
+          payment.amountNaira,
+
+        paymentStatus:
+          "successful",
+
+        createdAt:
+          now,
+
+        updatedAt:
+          now
+
+      };
+
+
+      /*
+       * ACTUAL TASK UPLOAD.
+       *
+       * This happens only after successful payment.
+       */
+
+      transaction.set(
+        taskRef,
+        taskData
+      );
+
+
+      /*
+       * TRANSACTION RECORD
+       */
+
+      const transactionDoc =
+        db
+          .collection(
+            "transactions"
+          )
+          .doc(
+            paymentReference
+          );
+
+
+      transaction.set(
+        transactionDoc,
+        {
+
+          uid:
+            payment.uid,
+
+          type:
+            "debit",
+
+          category:
+            "task_creation",
+
+          purpose:
+            "Task Creation",
+
+          amount:
+            Number(
+              payment.amountNaira
+            ),
+
+          currency:
+            "NGN",
+
+          status:
+            "Successful",
+
+          reference:
+            paymentReference,
+
+          gatewayRef:
+            webhook.gatewayRef ||
+            null,
+
+          source:
+            "Squad",
+
+          taskId,
+
+          description:
+            `Task creation fee - ₦${payment.amountNaira}`,
+
+          createdAt:
+            FieldValue.serverTimestamp()
+
+        }
+      );
+
+
+      /*
+       * FINALIZE PAYMENT RECORD.
+       *
+       * Notice:
+       *
+       * credited = false
+       *
+       * because the ₦1,000 is NOT wallet funding.
+       */
+
+      transaction.update(
+        paymentDoc,
+        {
+
+          status:
+            "successful",
+
+          credited:
+            false,
+
+          taskCreated:
+            true,
+
+          taskId,
+
+          gatewayRef:
+            webhook.gatewayRef ||
+            null,
+
+          completedAt:
+            FieldValue.serverTimestamp(),
+
+          updatedAt:
+            FieldValue.serverTimestamp()
+
+        }
+      );
+
+
+      return {
+
+        found:
+          true,
+
+        alreadyProcessed:
+          false,
+
+        successful:
+          true,
+
+        taskId,
+
+        amount:
+          payment.amountNaira
+
+      };
+
+    }
+  );
+
+}
+
+
+/* ============================================================
    SQUAD WEBHOOK
    ============================================================ */
 
@@ -1779,6 +2717,103 @@ async function squadWebhook(
     }
 
 
+    /*
+     * FIND THE PAYMENT FIRST.
+     *
+     * This allows the server to distinguish:
+     *
+     * wallet_funding
+     *
+     * from
+     *
+     * task_creation
+     */
+
+    const paymentSnapshot =
+      await db
+        .collection(
+          "squadPayments"
+        )
+        .doc(
+          webhook.reference
+        )
+        .get();
+
+
+    if (
+      !paymentSnapshot.exists
+    ) {
+
+      console.error(
+        "Squad webhook payment record not found:",
+        webhook.reference
+      );
+
+
+      return res.status(404).json({
+
+        response_code:
+          404,
+
+        response_description:
+          "Payment record not found"
+
+      });
+
+    }
+
+
+    const payment =
+      paymentSnapshot.data();
+
+
+    /*
+     * TASK CREATION PAYMENT
+     */
+
+    if (
+      payment.purpose ===
+      "task_creation"
+    ) {
+
+      const result =
+        await createTaskAfterSuccessfulPayment(
+          webhook.reference,
+          webhook
+        );
+
+
+      return res.status(200).json({
+
+        response_code:
+          200,
+
+        transaction_reference:
+          webhook.reference,
+
+        response_description:
+          result.alreadyProcessed
+            ? "Already processed"
+            : result.successful === false
+              ? "Payment failed"
+              : "Success",
+
+        task_id:
+          result.taskId ||
+          null
+
+      });
+
+    }
+
+
+    /*
+     * ALL OTHER EXISTING PAYMENT FLOWS
+     *
+     * Continue using the original wallet-credit
+     * function exactly as before.
+     */
+
     const result =
       await creditWalletFromPayment(
         webhook.reference,
@@ -1826,231 +2861,6 @@ async function squadWebhook(
   }
 
 }
-
-
-/* ============================================================
-   CREATE TASK PAYMENT
-   ============================================================ */
-
-/*
- * Existing Naira Master source uses:
- *
- * TASK CREATION FEE = ₦1,000
- *
- * We keep this configurable through ENV.
- */
-
-const TASK_CREATION_FEE =
-  Number(
-    process.env.TASK_CREATION_FEE ||
-    1000
-  );
-
-
-app.post(
-  "/api/payments/create-task",
-  authenticateFirebaseUser,
-  async (req, res) => {
-
-    try {
-
-      const uid =
-        req.user.uid;
-
-      const email =
-        req.user.email ||
-        req.body.email;
-
-
-      if (!email) {
-
-        return res.status(400).json({
-
-          success: false,
-
-          message:
-            "Customer email is required."
-
-        });
-
-      }
-
-
-      const taskPayload =
-        req.body.taskPayload;
-
-
-      if (
-        !taskPayload ||
-        typeof taskPayload !==
-          "object"
-      ) {
-
-        return res.status(400).json({
-
-          success: false,
-
-          message:
-            "taskPayload is required."
-
-        });
-
-      }
-
-
-      const amountNaira =
-        TASK_CREATION_FEE;
-
-
-      const amountKobo =
-        nairaToKobo(
-          amountNaira
-        );
-
-
-      const reference =
-        generateReference(
-          "NM_TASK"
-        );
-
-
-      const paymentDoc =
-        db
-          .collection(
-            "squadPayments"
-          )
-          .doc(
-            reference
-          );
-
-
-      await paymentDoc.create({
-
-        reference,
-
-        uid,
-
-        email,
-
-        amountNaira,
-
-        amountKobo,
-
-        currency:
-          "NGN",
-
-        purpose:
-          "task_creation",
-
-        status:
-          "pending",
-
-        credited:
-          false,
-
-        taskPayload,
-
-        createdAt:
-          FieldValue.serverTimestamp(),
-
-        updatedAt:
-          FieldValue.serverTimestamp()
-
-      });
-
-
-      const callbackUrl =
-        process.env.FRONTEND_URL
-          ? (
-              process.env.FRONTEND_URL
-                .replace(/\/$/, "") +
-              "/?payment=task-complete"
-            )
-          : undefined;
-
-
-      const checkout =
-        await createSquadCheckout({
-
-          amountKobo,
-
-          email,
-
-          customerName:
-            req.user.name ||
-            "Naira Master User",
-
-          reference,
-
-          callbackUrl,
-
-          metadata: {
-
-            uid,
-
-            purpose:
-              "task_creation",
-
-            naira_master_reference:
-              reference
-
-          }
-
-        });
-
-
-      await paymentDoc.update({
-
-        checkoutUrl:
-          checkout.checkoutUrl,
-
-        squadReference:
-          checkout.transactionRef,
-
-        updatedAt:
-          FieldValue.serverTimestamp()
-
-      });
-
-
-      return res.json({
-
-        success: true,
-
-        reference,
-
-        checkoutUrl:
-          checkout.checkoutUrl,
-
-        amount:
-          amountNaira
-
-      });
-
-    } catch (error) {
-
-      console.error(
-        "TASK PAYMENT ERROR:",
-        error
-      );
-
-
-      return res.status(
-        error.status || 400
-      ).json({
-
-        success: false,
-
-        message:
-          error.message ||
-          "Unable to initialize task payment."
-
-      });
-
-    }
-
-  }
-);
 
 
 /* ============================================================
