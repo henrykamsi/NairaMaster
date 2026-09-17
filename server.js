@@ -161,6 +161,112 @@ app.use(
  * Therefore the webhook route MUST receive the raw body
  * before express.json() modifies it.
  */
+// ============================================================
+// TEMPORARY PAYMENT TEST ENDPOINT
+// Remove this endpoint after testing.
+// ============================================================
+
+app.post(
+  "/api/test/simulate-payment",
+  requireAuth,
+  async (req, res) => {
+    try {
+      if (process.env.PAYMENT_TEST_MODE !== "true") {
+        return res.status(403).json({
+          success: false,
+          message: "Payment test mode is disabled."
+        });
+      }
+
+      const { reference } = req.body;
+
+      if (!reference) {
+        return res.status(400).json({
+          success: false,
+          message: "reference is required."
+        });
+      }
+
+      const paymentRef =
+        db.collection("squadPayments").doc(reference);
+
+      const paymentSnap =
+        await paymentRef.get();
+
+      if (!paymentSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message: "Payment reference not found."
+        });
+      }
+
+      const payment =
+        paymentSnap.data();
+
+      if (payment.uid !== req.user.uid) {
+        return res.status(403).json({
+          success: false,
+          message: "Payment does not belong to this user."
+        });
+      }
+
+      if (payment.status === "successful" && payment.credited === true) {
+        return res.json({
+          success: true,
+          message: "Payment was already credited.",
+          reference,
+          alreadyCredited: true
+        });
+      }
+
+      const simulatedWebhook = {
+        reference,
+        status: "successful",
+        amountKobo: Number(payment.amountKobo),
+        currency: "NGN",
+        gatewayRef: "TEST_GATEWAY_" + Date.now(),
+        metadata: {}
+      };
+
+      if (payment.purpose === "task_creation") {
+        await createTaskAfterSuccessfulPayment(
+          reference,
+          simulatedWebhook
+        );
+
+        return res.json({
+          success: true,
+          message: "Task payment simulation completed.",
+          reference,
+          purpose: "task_creation"
+        });
+      }
+
+      await creditWalletFromPayment(
+        reference,
+        simulatedWebhook
+      );
+
+      return res.json({
+        success: true,
+        message: "Wallet payment simulation completed.",
+        reference,
+        purpose: payment.purpose
+      });
+
+    } catch (error) {
+      console.error(
+        "TEST PAYMENT ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
 
 app.post(
   "/api/squad/webhook",
